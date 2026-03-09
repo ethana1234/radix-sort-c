@@ -14,8 +14,7 @@ _Thread_local LaneCtx g_lane_ctx;
  */
 int64_t LaneIdx(void)
 {
-    // TODO: Return this lane's index from g_lane_ctx.
-    return -1;
+    return g_lane_ctx.lane_idx;
 }
 
 /*
@@ -23,8 +22,7 @@ int64_t LaneIdx(void)
  */
 int64_t LaneCount(void)
 {
-    // TODO: Return the lane count from g_lane_ctx.
-    return -1;
+    return g_lane_ctx.lane_count;
 }
 
 /*
@@ -32,8 +30,10 @@ int64_t LaneCount(void)
  */
 void LaneSync(void)
 {
-    // TODO: If lane_count == 1, return immediately (no sync needed).
-    // Otherwise, use pthread_barrier_wait on g_lane_ctx.barrier.
+    if (g_lane_ctx.lane_count == 1) return;
+    // This function returns -1 for one thread and 0 for the rest
+    // This could be a useful alternative for "going narrow"
+    pthread_barrier_wait(g_lane_ctx.barrier);
 }
 
 /*
@@ -55,8 +55,12 @@ LaneRange LaneRangeOf(int64_t count)
     //   one_past_last       = first + items_per_lane + (has_leftover ? 1 : 0)
     //
     LaneRange r;
-    r.first = 0;
-    r.one_past_last = 0;
+    int64_t items_per_lane = count / g_lane_ctx.lane_count;
+    int64_t leftover = count % g_lane_ctx.lane_count;
+    int64_t has_leftover = g_lane_ctx.lane_idx < leftover;
+    int64_t leftovers_before_me = has_leftover ? g_lane_ctx.lane_idx : leftover;
+    r.first = items_per_lane * g_lane_ctx.lane_idx + leftovers_before_me;
+    r.one_past_last = r.first + items_per_lane + (has_leftover ? 1 : 0);
     return r;
 }
 
@@ -75,6 +79,10 @@ void LaneBroadcastU64(uint64_t *value_ptr, int64_t src_lane_idx)
     //   3. If this lane is NOT the source, copy *shared_buf into *value_ptr.
     //   4. LaneSync() — ensure all lanes have read before buffer is reused.
     //
+    if (g_lane_ctx.lane_idx == src_lane_idx) *g_lane_ctx.shared_buf = *value_ptr;
+    LaneSync();
+    if (g_lane_ctx.lane_idx != src_lane_idx) *value_ptr = *g_lane_ctx.shared_buf;
+    LaneSync();
 }
 
 // ---------------------------------------------------------------------------
@@ -83,8 +91,12 @@ void LaneBroadcastU64(uint64_t *value_ptr, int64_t src_lane_idx)
 
 static void *thread_start(void *raw_args)
 {
-    // TODO: Cast raw_args to ThreadStartArgs*, populate g_lane_ctx from it,
-    // then call the entry function.
+    ThreadStartArgs *thread_start_args = (ThreadStartArgs *)raw_args;
+    g_lane_ctx.lane_idx = thread_start_args->lane_idx;
+    g_lane_ctx.lane_count = thread_start_args->lane_count;
+    g_lane_ctx.barrier = thread_start_args->barrier;
+    g_lane_ctx.shared_buf = thread_start_args->shared_buf;
+    thread_start_args->entry_fn();
     return NULL;
 }
 
@@ -95,15 +107,31 @@ static void *thread_start(void *raw_args)
  */
 void BootstrapLanes(int64_t lane_count, LaneEntryFn entry_fn)
 {
-    // TODO:
-    // 1. If lane_count == 1, set up g_lane_ctx directly, call entry_fn(),
-    //    and return (no threads needed).
-    //
-    // 2. Otherwise:
-    //    a. Allocate and init a pthread_barrier_t for `lane_count` threads.
-    //    b. Allocate a shared_buf (uint64_t*) for cross-lane communication.
-    //    c. For each lane, allocate a ThreadStartArgs, fill it in, and
-    //       call pthread_create with thread_start as the start routine.
-    //    d. pthread_join all threads.
-    //    e. Free the barrier, shared_buf, and thread args.
+    if (lane_count == 1) {
+        g_lane_ctx.lane_idx = 0;
+        g_lane_ctx.lane_count = 1;
+        g_lane_ctx.shared_buf = malloc(sizeof(uint64_t));
+        entry_fn();
+        free(g_lane_ctx.shared_buf);
+        return;
+    }
+    pthread_barrier_t *barrier = malloc(sizeof(pthread_barrier_t));
+    pthread_barrier_init(barrier, NULL, lane_count);
+    uint64_t *shared_buf = malloc(sizeof(uint64_t));
+    pthread_t *thread_ids = malloc(lane_count * sizeof(pthread_t));
+    ThreadStartArgs **thread_args_array = malloc(lane_count * sizeof(ThreadStartArgs *));
+    for (int64_t i=0; i<lane_count; i++) {
+        thread_args_array[i] = malloc(sizeof(ThreadStartArgs));
+        thread_args_array[i]->lane_idx = i;
+        thread_args_array[i]->lane_count = lane_count;
+        thread_args_array[i]->barrier = barrier;
+        thread_args_array[i]->shared_buf = shared_buf;
+        thread_args_array[i]->entry_fn = entry_fn;
+        pthread_create(&(thread_ids[i]), NULL, thread_start, thread_args_array[i]);
+    }
+    for (int64_t i=0; i<lane_count; i++) pthread_join(thread_ids[i], NULL);
+    free(barrier);
+    free(shared_buf);
+    free(thread_ids);
+    free(thread_args_array);
 }

@@ -17,5 +17,15 @@ int64_t parallel_sum(const int64_t *values, int64_t count)
     //    Either works — pick whichever you prefer.
     //
     // 4. Return the total sum (same value on every lane).
-    return 0;
+    int64_t lane_idx = LaneIdx();
+    // Use lane 0 to init total sum to 0
+    if (!lane_idx) *g_lane_ctx.shared_buf = 0;
+    LaneSync();
+    LaneRange r = LaneRangeOf(count);
+    int64_t partial_sum = 0;
+    for (int64_t i=r.first; i<r.one_past_last; i++) partial_sum += values[i];
+    //printf("adding %ld to %ld on lane %ld\n", *g_lane_ctx.shared_buf, partial_sum, lane_idx);
+    atomic_fetch_add((_Atomic uint64_t *)g_lane_ctx.shared_buf, partial_sum);
+    LaneSync();
+    return *g_lane_ctx.shared_buf;
 }

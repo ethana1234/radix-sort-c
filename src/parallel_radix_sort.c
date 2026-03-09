@@ -86,4 +86,41 @@ void parallel_radix_sort(int64_t *values, int64_t count)
     //   - If the final result ended up in temp_buf (not `values`), copy it
     //     back to `values` (can be parallelized with LaneRangeOf).
     //   - Free the temporary buffer (one lane).
+
+    int64_t lane_idx = LaneIdx();
+    int64_t lane_count = LaneCount();
+    int64_t *temp_buf;
+    int64_t *histogram;
+    if (lane_idx == 0) {
+        temp_buf = malloc(count * sizeof(int64_t));
+        histogram = malloc(lane_count * RADIX * sizeof(int64_t));
+    }
+    uint64_t ptr_as_u64 = (uint64_t)temp_buf;
+    LaneBroadcastU64(&ptr_as_u64, 0);
+    temp_buf = (int64_t *)ptr_as_u64;
+    uint64_t *hist_as_u64 = (uint64_t *)histogram;
+    LaneBroadcastU64(&hist_as_u64, 0);
+    histogram = (int64_t *)hist_as_u64;
+    int64_t *src = values;
+    int64_t *dest = temp_buf;
+    for (int i=0; i<NUM_PASSES; i++) {
+        // Histogram phase
+        memset(&histogram[lane_idx * RADIX], 0, RADIX * sizeof(int64_t));
+        LaneSync();
+        LaneRange r = LaneRangeOf(count);
+        for (int64_t j=r.first; j<r.one_past_last; j++) {
+            uint8_t b = extract_byte(src[j], i);
+            histogram[lane_idx * RADIX + b]++;
+        }
+        LaneSync();
+        // Reduce phase
+        if (lane_idx == 0) {
+            for (int64_t j=1; j<lane_count; j++) {
+                for (int64_t k=0; k<RADIX; k++) {
+                    histogram[k] += histogram[j * RADIX + k];
+                }
+            }
+        }
+        LaneSync();
+    }
 }
