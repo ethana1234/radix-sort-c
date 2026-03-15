@@ -124,9 +124,25 @@ Pass for byte position `b` (b = 0..7):
   2. PREFIX SUM: Compute exclusive prefix sums of the histogram to determine
      destination offsets. This is O(256) — negligible, done on one lane.
 
+Histogram:
+              bucket 0   bucket 1   bucket 2   bucket 3
+lane 0:          3          1          0          4
+lane 1:          2          2          1          1
+lane 2:          1          0          3          2
+
+Prefix Sums:
+              bucket 0   bucket 1   bucket 2   bucket 3
+                 0          6          9         13
+
+Prefix Sums Per Lane:
+              bucket 0   bucket 1   bucket 2   bucket 3
+lane 0:          0          6          9         13
+lane 1:          3          7          9         17
+lane 2:          5          9         10         18
+
   3. SCATTER: Each element is placed at its destination in the output buffer
-     based on its byte value and the prefix sum table. Each lane scatters its
-     own range.
+     based on its byte value and per-lane offset tables. Each lane scatters
+     its own range using pre-computed offsets (no atomics), ensuring stability.
 
   After each pass, swap the source and destination buffers.
 ```
@@ -144,27 +160,27 @@ histogram and scatter index on the final (byte 7) pass.
                     ┌────────────────▼────────────────┐
                     │  HISTOGRAM (parallel per lane)  │
                     │  Count byte[b] for each element │
-                    │  in this lane's range            │
+                    │  in this lane's range           │
                     └────────────────┬────────────────┘
                                      │ LaneSync
                     ┌────────────────▼────────────────┐
-                    │  REDUCE histograms (one lane     │
-                    │  sums all per-lane histograms)   │
+                    │  REDUCE histograms (one lane    │
+                    │  sums all per-lane histograms)  │
                     └────────────────┬────────────────┘
                                      │ LaneSync
                     ┌────────────────▼────────────────┐
-                    │  PREFIX SUM (one lane)           │
-                    │  exclusive scan of 256 counts    │
+                    │  PREFIX SUM (one lane)          │
+                    │  exclusive scan of 256 counts   │
                     └────────────────┬────────────────┘
                                      │ LaneSync
                     ┌────────────────▼────────────────┐
-                    │  SCATTER (parallel per lane)     │
-                    │  Place elements at dest offsets  │
-                    │  (use atomics for dest index)    │
+                    │  SCATTER (parallel per lane)    │
+                    │  Place elements at dest offsets │
+                    │  (per-lane offsets, no atomics) │
                     └────────────────┬────────────────┘
                                      │ LaneSync
                     ┌────────────────▼────────────────┐
-                    │  Swap src ↔ dst buffers          │
+                    │  Swap src ↔ dst buffers         │
                     └─────────────────────────────────┘
 ```
 
@@ -186,21 +202,27 @@ histogram and scatter index on the final (byte 7) pass.
 
 5. Implement `parallel_radix_sort()` for `int64_t` keys using LSD radix sort
    with base-256 (one byte per pass, 8 passes).
-6. The histogram phase must be parallelized: each lane histograms its own range,
-   then a single lane reduces (sums) all per-lane histograms.
-7. The scatter phase must be parallelized: each lane scatters its own range of
-   elements to the output buffer, using atomic increments on the prefix-sum
-   offsets to claim destination slots.
+6. The histogram phase must be parallelized: each lane histograms its own range
+   into a shared flat array `histogram[lane_count * RADIX]` (where lane `L`'s
+   counts live at `histogram[L * RADIX ... (L+1) * RADIX)`), then a single lane
+   reduces (sums) all per-lane histograms into a global histogram.
+7. The scatter phase must be **stable** and parallelized. LSD radix sort
+   requires stability — elements with the same byte value must keep their
+   relative order from the previous pass. To achieve this, compute **per-lane
+   offsets** after the global prefix sum: for each bucket `b`, lane 0's
+   elements start at `prefix_sum[b]`, lane 1's start at
+   `prefix_sum[b] + histogram[0 * RADIX + b]`, lane 2's start at
+   `prefix_sum[b] + histogram[0 * RADIX + b] + histogram[1 * RADIX + b]`,
+   and so on. Each lane then scatters its range using its own offsets,
+   incrementing locally — no atomics needed.
 8. The sort must correctly handle negative numbers (signed `int64_t`).
 9. The sort must work correctly with `lane_count = 1`.
 
 ### Stretch Goals
 
-10. Avoid atomics in scatter by computing per-lane prefix sums (each lane knows
-    exactly where its elements go without contention).
-11. Skip passes where all bytes are identical (the histogram is concentrated in
+10. Skip passes where all bytes are identical (the histogram is concentrated in
     a single bucket).
-12. Benchmark and print speedup relative to single-lane execution.
+11. Benchmark and print speedup relative to single-lane execution.
 
 ## Suggested Milestones
 
@@ -218,7 +240,7 @@ histogram and scatter index on the final (byte 7) pass.
 - [ ] Implement single-lane (serial) radix sort first — get the algorithm right
       before parallelizing.
 - [ ] Parallelize the histogram phase (per-lane histograms + reduction).
-- [ ] Parallelize the scatter phase (atomic offset claims).
+- [ ] Parallelize the scatter phase (per-lane offsets for stability).
 - [ ] Handle signed integers on the final byte pass.
 - [ ] Verify correctness against `qsort` on random data, edge cases (empty,
       single element, all same, already sorted, reverse sorted, negatives).

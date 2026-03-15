@@ -29,6 +29,8 @@ int main(void)
     // Fill with random values.
     for (int64_t i = 0; i < ARRAY_SIZE; i++) {
         g_values[i] = (int64_t)(rand() % 10000) - 5000;
+        // Uncomment for larger values that fill 64 bit ints
+        //g_values[i] = ((int64_t)rand() << 32) ^ ((int64_t)rand());
     }
 
     printf("Multi-Core by Default — Parallel Sum & Radix Sort\n");
@@ -44,7 +46,7 @@ int main(void)
 
     // --- Parallel Radix Sort ---
     printf("Running parallel radix sort...\n");
-    BootstrapLanes(LANE_COUNT, sort_entry);
+    //BootstrapLanes(LANE_COUNT, sort_entry);
 
     // Verify sorted.
     int sorted = 1;
